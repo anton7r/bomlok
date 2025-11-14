@@ -1,0 +1,244 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"strings"
+	"text/template"
+)
+
+var (
+	includeDirs stringSliceFlag
+	excludeDirs stringSliceFlag
+	verbose     bool
+)
+
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string {
+	return strings.Join(*s, ",")
+}
+
+func (s *stringSliceFlag) Set(value string) error {
+	*s = append(*s, value)
+	return nil
+}
+
+type StructInfo struct {
+	Name        string
+	Fields      []FieldInfo
+	PackageName string
+}
+
+type FieldInfo struct {
+	Name string
+	Type string
+}
+
+func main() {
+	flag.Var(&includeDirs, "include", "Directories to include (can be specified multiple times)")
+	flag.Var(&excludeDirs, "exclude", "Directories to exclude (can be specified multiple times)")
+	flag.BoolVar(&verbose, "verbose", false, "Enable verbose output")
+	flag.Parse()
+
+	// Default to current directory if no includes specified
+	if len(includeDirs) == 0 {
+		includeDirs = []string{"."}
+	}
+
+	if verbose {
+		fmt.Printf("Include directories: %v\n", includeDirs)
+		fmt.Printf("Exclude directories: %v\n", excludeDirs)
+	}
+
+	for _, dir := range includeDirs {
+		if err := processDirectory(dir); err != nil {
+			fmt.Fprintf(os.Stderr, "Error processing directory %s: %v\n", dir, err)
+			os.Exit(1)
+		}
+	}
+}
+
+func processDirectory(root string) error {
+	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip excluded directories
+		if info.IsDir() {
+			for _, excluded := range excludeDirs {
+				if matched, _ := filepath.Match(excluded, filepath.Base(path)); matched {
+					if verbose {
+						fmt.Printf("Skipping excluded directory: %s\n", path)
+					}
+					return filepath.SkipDir
+				}
+				// Also check absolute path matching
+				if absExcluded, err := filepath.Abs(excluded); err == nil {
+					if absPath, err := filepath.Abs(path); err == nil {
+						if strings.HasPrefix(absPath, absExcluded) {
+							if verbose {
+								fmt.Printf("Skipping excluded directory: %s\n", path)
+							}
+							return filepath.SkipDir
+						}
+					}
+				}
+			}
+			return nil
+		}
+
+		// Only process Go files, skip generated files and test files
+		if !strings.HasSuffix(path, ".go") ||
+			strings.HasSuffix(path, "_test.go") ||
+			strings.HasSuffix(path, "_bomlok.go") {
+			return nil
+		}
+
+		if verbose {
+			fmt.Printf("Processing file: %s\n", path)
+		}
+
+		return processGoFile(path)
+	})
+}
+
+func processGoFile(filename string) error {
+	fset := token.NewFileSet()
+	node, err := parser.ParseFile(fset, filename, nil, parser.ParseComments)
+	if err != nil {
+		return fmt.Errorf("failed to parse file %s: %w", filename, err)
+	}
+
+	var structs []StructInfo
+
+	// Find all struct declarations
+	ast.Inspect(node, func(n ast.Node) bool {
+		typeSpec, ok := n.(*ast.TypeSpec)
+		if !ok {
+			return true
+		}
+
+		structType, ok := typeSpec.Type.(*ast.StructType)
+		if !ok {
+			return true
+		}
+
+		structInfo := StructInfo{
+			Name:        typeSpec.Name.Name,
+			PackageName: node.Name.Name,
+			Fields:      []FieldInfo{},
+		}
+
+		// Extract field information
+		for _, field := range structType.Fields.List {
+			fieldType := getTypeString(field.Type)
+			for _, name := range field.Names {
+				structInfo.Fields = append(structInfo.Fields, FieldInfo{
+					Name: name.Name,
+					Type: fieldType,
+				})
+			}
+		}
+
+		structs = append(structs, structInfo)
+		return true
+	})
+
+	// Generate code if structs were found
+	if len(structs) > 0 {
+		if err := generateBomlokFile(filename, structs); err != nil {
+			return fmt.Errorf("failed to generate code for %s: %w", filename, err)
+		}
+		if verbose {
+			fmt.Printf("Generated code for %d struct(s) in %s\n", len(structs), filename)
+		}
+	}
+
+	return nil
+}
+
+func getTypeString(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		return "*" + getTypeString(t.X)
+	case *ast.ArrayType:
+		return "[]" + getTypeString(t.Elt)
+	case *ast.MapType:
+		return "map[" + getTypeString(t.Key) + "]" + getTypeString(t.Value)
+	case *ast.SelectorExpr:
+		return getTypeString(t.X) + "." + t.Sel.Name
+	case *ast.InterfaceType:
+		return "interface{}"
+	default:
+		return "interface{}"
+	}
+}
+
+func generateBomlokFile(originalFile string, structs []StructInfo) error {
+	// Generate output filename
+	dir := filepath.Dir(originalFile)
+	base := filepath.Base(originalFile)
+	nameWithoutExt := strings.TrimSuffix(base, ".go")
+	outputFile := filepath.Join(dir, nameWithoutExt+"_bomlok.go")
+
+	// Create output file
+	f, err := os.Create(outputFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// Use template to generate code
+	tmpl := template.Must(template.New("bomlok").Parse(bomlokTemplate))
+	return tmpl.Execute(f, map[string]interface{}{
+		"PackageName": structs[0].PackageName,
+		"Structs":     structs,
+	})
+}
+
+const bomlokTemplate = `// Code generated by bomlok. DO NOT EDIT.
+
+package {{.PackageName}}
+
+{{range .Structs}}
+// Bomlok_GetValue returns the value of the field with the given name for {{.Name}}
+func (s *{{.Name}}) Bomlok_GetValue(field string) any {
+	switch field {
+	{{range .Fields}}case "{{.Name}}":
+		return s.{{.Name}}
+	{{end}}default:
+		return nil
+	}
+}
+
+// Bomlok_Fields returns all field names for {{.Name}}
+func (s *{{.Name}}) Bomlok_Fields() []string {
+	return []string{
+		{{range .Fields}}"{{.Name}}",
+		{{end}}
+	}
+}
+{{end}}
+`
+
+func init() {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Bomlok code generator - generates Bomlok interface implementations for Go structs\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  %s -include=./models -include=./entities\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -include=. -exclude=vendor -exclude=.git\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -include=./src -exclude=test -verbose\n", os.Args[0])
+	}
+}

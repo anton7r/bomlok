@@ -4,7 +4,7 @@
 *.dll
 *.so
 *.dylib
-bomlok
+*_bomlok.go
 
 # Test binary, built with `go test -c`
 *.test
