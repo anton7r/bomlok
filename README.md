@@ -163,7 +163,7 @@ fmt.Println(age) // 30
 
 ## Benefits
 
-- **Performance**: No reflection overhead at runtime
+- **Performance**: No reflection overhead at runtime, Bomlok is approximately 200-260x faster than reflection for getting field values, with zero memory allocations.
 - **Type Safety**: Generated code is type-checked at compile time
 - **Zero Dependencies**: Generated code has no external dependencies
 - **Simple**: Easy to integrate into existing projects
